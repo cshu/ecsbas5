@@ -1,0 +1,22 @@
+[package]
+name = "ecsbas5"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+env_logger = "*"
+log = "*"
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+scopeguard = "*"
+dirs = "*"
+rusqlite = { version = "*", features = ["bundled"] }
+chrono = "*"
+walkdir = "*"
+crabrs = { git = "https://github.com/cshu/crabrs" }
+crabsqliters = { git = "https://github.com/cshu/crabsqliters" }
+
+[profile.release]
+debug = 1
