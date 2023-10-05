@@ -5,6 +5,7 @@
 mod util;
 
 //note "_bm" are reserved label for labelling notes containing web page bookmarks
+//note "_code" are reserved label for labelling notes containing ``` code blocks
 
 //todo allow importing Chrome Bookmark Export HTML file into notes
 //todo add feature of detecting and listing URL(s) in note. And user may select one of them to copy into clipboard
@@ -922,6 +923,9 @@ fn read_note(folder: &path::Path, jobj: &mut InfoJsonElem) -> CustRes<()> {
     jobj.content = fs::read_to_string(&npath)?;
     if jobj.content.contains("http://") || jobj.content.contains("https://") {
         jobj.lbls.push("_bm".to_owned());
+    }
+    if jobj.content.split(['\n', '\r']).any(|r| r == "```") {
+        jobj.lbls.push("_code".to_owned());
     }
     if !apath.try_exists()? {
         return Ok(());
