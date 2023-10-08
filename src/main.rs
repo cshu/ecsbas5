@@ -4,11 +4,12 @@
 #![allow(clippy::assertions_on_constants)]
 mod util;
 
-//note "_bm" are reserved label for labelling notes containing web page bookmarks
-//note "_code" are reserved label for labelling notes containing ``` code blocks
+//note "b" are reserved label for labelling notes containing web page bookmarks
+//note "c" are reserved label for labelling notes containing ``` code blocks
 
 //todo allow importing Chrome Bookmark Export HTML file into notes
-//todo add feature of detecting and listing URL(s) in note. And user may select one of them to copy into clipboard
+//todo add feature of listing URL(s) in note. And user may select one of them to copy into clipboard
+//todo add feature of recent history of complicated queries submitted by user?
 
 use crabrs::*;
 use crabsqliters::*;
@@ -25,6 +26,9 @@ use crate::util::*;
 
 #[macro_use(defer)]
 extern crate scopeguard;
+
+const PKG_NAME: &str = env!("CARGO_PKG_NAME");
+const _: () = assert!(!PKG_NAME.is_empty(), "Constraint on const");
 
 fn main() -> ExitCode {
     env::set_var("RUST_BACKTRACE", "1"); //? not 100% sure this has 0 impact on performance? Maybe setting via command line instead of hardcoding is better?
@@ -88,6 +92,109 @@ fn cmd_cat(con: &mut Ctx) -> CustRes<bool> {
     }
     println!("{}{}{}", "******* ", num_of_selected, " SELECTED");
     return Ok(true);
+}
+fn cmd_yank(con: &mut Ctx) -> CustRes<bool> {
+    let mut finaltext = String::new();
+    let mut cached_stmt = con
+        .db
+        .prepare_cached("select content from files where tmpid=?1")?;
+    let mut num_of_selected = 0;
+    for (idx, tidraw) in con.def.filter_buf.iter().enumerate() {
+        let tid: i64 = if *tidraw < 0 {
+            num_of_selected += 1;
+            -tidraw
+        } else {
+            continue;
+        };
+        finaltext += &format!("{}{}{}", "[", idx, "]\n");
+        let mut rows = cached_stmt.query((tid,))?;
+        let row = rows.next()?.ok_or("TMPID unexpectedly invalid")?;
+        let cont: String = row.get(0)?;
+        finaltext += &cont;
+        finaltext += "\n";
+    }
+    finaltext += &format!("{}{}{}", "******* ", num_of_selected, " SELECTED\n");
+    run_xclip(con, finaltext)
+}
+fn cmd_clip(con: &mut Ctx) -> CustRes<bool> {
+    let mut tid = 0;
+    for selid in &con.def.filter_buf {
+        if *selid < 0 {
+            if tid != 0 {
+                coutln!("More than one note selected.");
+                return Ok(true);
+            }
+            tid = -selid;
+        }
+    }
+    if tid == 0 {
+        coutln!("No note selected.");
+        return Ok(true);
+    }
+    let cont: String = {
+        let mut cached_stmt = con
+            .db
+            .prepare_cached("select content from files where tmpid=?1")?;
+        let mut rows = cached_stmt.query((tid,))?;
+        let row = rows.next()?.ok_or("TMPID unexpectedly invalid")?;
+        row.get(0)?
+    };
+    let mut finaltext = String::new();
+    let mut lineiter = cont.split(['\n', '\r']);
+    while let Some(ln) = lineiter.next() {
+        if let Some(urlidx) = ln.find("https://") {
+            finaltext = ln[urlidx..].to_owned();
+            break;
+        }
+        if let Some(urlidx) = ln.find("http://") {
+            finaltext = ln[urlidx..].to_owned();
+            break;
+        }
+        if ln != "```" {
+            continue;
+        }
+        while let Some(codeln) = lineiter.next() {
+            if codeln == "```" {
+                break;
+            }
+            if !finaltext.is_empty() {
+                finaltext.push('\n');
+            }
+            finaltext += codeln;
+        }
+        break;
+    }
+    if finaltext.is_empty() {
+        finaltext = cont;
+        coutln!("Begin copying to clipboard...");
+    } else {
+        coutln!("Begin copying EXCERPT to clipboard...");
+    }
+    run_xclip(con, finaltext)
+}
+fn run_xclip(con: &Ctx, finaltext: String) -> CustRes<bool> {
+    let mut cmd = Command::new(&con.def.clip_cmd[0]);
+    if con.def.clip_cmd.len() > 1 {
+        cmd.args(&con.def.clip_cmd[1..]);
+    }
+    //note using Stdio::null() to avoid command output appear on terminal of this program
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?; //todo no need to end program if spawn fails?
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .ok_or("Failed to get stdin of child proc")?
+        .write_all(finaltext.as_bytes())?;
+    if child.wait()?.success() {
+        coutln!("Finished copying to clipboard.");
+    } else {
+        coutln!("Command failed to copy to clipboard.");
+    }
+    Ok(true)
 }
 
 fn cmd_list(con: &mut Ctx) -> CustRes<bool> {
@@ -360,6 +467,13 @@ fn lbl_input(con: &mut Ctx) -> CustRes<bool> {
         println!("{}", "Cannot be empty.");
         return Ok(true);
     }
+    if pat.len() == 1 {
+        println!(
+            "{}",
+            "label length cannot be 1. (Such labels are reserved for internal use.)"
+        );
+        return Ok(true);
+    }
     if pat.starts_with('_') {
         println!(
             "{}",
@@ -543,6 +657,32 @@ fn minus(con: &mut Ctx) -> CustRes<bool> {
     lbl_remove(con, &lbl_distinct)?;
     Ok(true)
 }
+fn cust_search(con: &mut Ctx, cust_prefix: u8) -> CustRes<bool> {
+    let glob1 = &con.cust_search[&cust_prefix];
+    let mut pat = con.def.ilinearg();
+    if pat.is_empty() {
+        coutln!("Cannot be empty.");
+        return Ok(true);
+    }
+    macro_rules! selec {
+        () => {
+            "SELECT tmpid from files where "
+        };
+    }
+    let sqlstr = if con.filter_buf.is_empty() {
+        selec!().to_owned() + glob1
+    } else {
+        selec!().to_owned() + "tmpid in(select tid from filter_buf) and (" + glob1 + ")"
+    };
+    let tids = {
+        let mut cached_stmt = con.db.prepare_cached(&sqlstr)?;
+        pat.insert(0, '%');
+        pat.push('%');
+        query_n_collect_into_vec_i64(cached_stmt.query((pat,)))?
+    };
+    iter_rows_to_update_filter_buf(con, tids)?;
+    Ok(true)
+}
 fn ca_like(con: &mut Ctx) -> CustRes<bool> {
     let mut pat = con.def.ilinearg();
     if pat.is_empty() {
@@ -629,12 +769,15 @@ fn get_single_lbl_match(con: &mut Ctx) -> CustRes<String> {
     }
     Ok(lbl_distinct.into_iter().next().unwrap())
 }
-fn iter_rows_to_update_filter_buf(con: &mut Ctx, tids: Vec<i64>) -> Result<(), CustomErr> {
+fn iter_rows_to_update_filter_buf(con: &mut Ctx, mut tids: Vec<i64>) -> Result<(), CustomErr> {
     if tids.is_empty() {
         println!("{}", "Nothing found. Filtering is cancelled.");
     } else {
         clear_filter_buf(con)?;
         exec_with_slice_i64(&con.db, "insert into filter_buf values(?1)", &tids)?;
+        if tids.len() == 1 {
+            tids[0] = -tids[0]; //select IF only one result
+        }
         con.def.filter_buf = tids;
         show_recs_in_filter_buf(con)?;
     }
@@ -690,7 +833,7 @@ type TupU8FnCtx = (u8, fn(&mut Ctx) -> CustRes<bool>);
 
 fn main_inner(args: Vec<String>) -> CustRes<()> {
     let db = rusqlite::Connection::open_in_memory()?;
-    let cmds_arr: [TupStrFnCtx; 21] = [
+    let cmds_arr: [TupStrFnCtx; 23] = [
         ("reload".to_owned(), cmd_reload),
         ("exit".to_owned(), cmd_exit),
         ("quit".to_owned(), cmd_exit),
@@ -712,6 +855,8 @@ fn main_inner(args: Vec<String>) -> CustRes<()> {
         ("all".to_owned(), cmd_all),
         ("deselect".to_owned(), cmd_deselect),
         ("cat".to_owned(), cmd_cat),
+        ("c".to_owned(), cmd_clip),
+        ("y".to_owned(), cmd_yank),
     ];
     let cargs_arr: [TupStrFnCtx; 6] = [
         ("where".to_owned(), ca_where),
@@ -723,21 +868,57 @@ fn main_inner(args: Vec<String>) -> CustRes<()> {
     ];
     let bargs_arr: [TupU8FnCtx; 3] = [(b'/', slash), (b'+', plus), (b'-', minus)];
     //todo add user-customized command alias from config file (e.g. maybe ll for label, d for dir)
-    let home_dir = dirs::home_dir().ok_or("Failed to get home directory.")?;
-    if !real_dir_without_symlink(&home_dir) {
-        return dummy_err("Failed to recognize the home dir as folder.");
-    }
+    let ecdir = match env::var("ECSBAS5_APP_SUPPORT_DIR") {
+        Ok(vstr) => {
+            //note canonicalize returns err if file does not exist
+            let ecdir = std::fs::canonicalize(vstr)?;
+            if !real_dir_without_symlink(&ecdir) {
+                return dummy_err("Failed to recognize the ECSBAS5_APP_SUPPORT_DIR as folder.");
+            }
+            ecdir
+        }
+        Err(_) => {
+            let home_dir = dirs::home_dir().ok_or("Failed to get home directory.")?;
+            if !real_dir_without_symlink(&home_dir) {
+                return dummy_err("Failed to recognize the home dir as folder.");
+            }
+            let everycom = home_dir.join(".everycom");
+            everycom.join(PKG_NAME)
+        }
+    };
     let mut ctx = Ctx {
         args,
-        def: CtxDef::init(home_dir),
+        def: CtxDef::init(ecdir),
         db,
         cmds: BTreeMap::<String, fn(&mut Ctx) -> CustRes<bool>>::from(cmds_arr),
         cargs: BTreeMap::<String, fn(&mut Ctx) -> CustRes<bool>>::from(cargs_arr),
         bargs: BTreeMap::<u8, fn(&mut Ctx) -> CustRes<bool>>::from(bargs_arr),
+        cust_search: BTreeMap::<u8, String>::new(),
     };
     //note cmds must contain "" to make sure it is handled so that other commands can safely assume the input has at least one u8
     debug_assert!(ctx.cmds.contains_key(""));
     fs::create_dir_all(ctx.def.ndir())?;
+    //*** BEGIN cust_search config
+    let ecp = ctx.def.app_support_dir.join("cust_search");
+    if real_reg_file_without_symlink(&ecp) {
+        let coll: Vec<String> = fs::read_to_string(ecp)?
+            .lines()
+            .filter(|elem| elem.starts_with([',', '.', ';', '`', '=']) && elem.len() > 1)
+            .map(|elem| elem.to_owned())
+            .collect();
+        if coll.is_empty() {
+            coutln!("No valid cust_search.");
+        } else {
+            for cust in coll {
+                ctx.cust_search
+                    .insert(cust.as_bytes()[0], cust[1..].to_owned());
+            }
+            println!("{}{:?}", "Custom Search: ", ctx.cust_search);
+        }
+    } else {
+        coutln!("No cust_search.");
+    }
+    //*** END cust_search config
     //*** BEGIN editor_cmd config
     let ecp = ctx.def.app_support_dir.join("editor_cmd");
     if real_reg_file_without_symlink(&ecp) {
@@ -756,6 +937,39 @@ fn main_inner(args: Vec<String>) -> CustRes<()> {
         coutln!("No command for editor_cmd");
     }
     //*** END editor_cmd config
+    //*** BEGIN clip_cmd config
+    let ecp = ctx.def.app_support_dir.join("clip_cmd");
+    if real_reg_file_without_symlink(&ecp) {
+        let coll: Vec<String> = fs::read_to_string(ecp)?
+            .lines()
+            .filter(|elem| !elem.is_empty())
+            .map(|elem| elem.to_owned())
+            .collect();
+        if coll.is_empty() {
+            coutln!("No command found in clip_cmd.");
+        } else {
+            println!("{}{:?}", "Editor command: ", coll);
+            ctx.def.clip_cmd = coll;
+        }
+    } else {
+        #[cfg(target_os = "windows")]
+        pub fn def_clip() -> Vec<String> {
+            coutln!("No command for clip_cmd, using default 'clip.exe'");
+            vec!["clip".to_owned()]
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        pub fn def_clip() -> Vec<String> {
+            coutln!("No command for clip_cmd, using default 'xclip -selection clipboard'");
+            vec![
+                "xclip".to_owned(),
+                "-selection".to_owned(),
+                "clipboard".to_owned(),
+            ]
+        }
+        ctx.def.clip_cmd = def_clip();
+    }
+    //*** END clip_cmd config
     //note no need to set chosen_dir. It should just be empty, which represents note_dir.
     //ctx.def.chosen_dir = ctx
     //    .def
@@ -763,8 +977,11 @@ fn main_inner(args: Vec<String>) -> CustRes<()> {
     //    .to_str()
     //    .ok_or("Failed to conv note dir to str")?
     //    .to_owned();
-    //fixme instead of waiting indefinitely for file lock, just try and tell user if they want to use READ-ONLY mode
+    //todo instead of refusing to launch 2 instances, ask user if they want to use READ-ONLY mode
     let flock = monitor_enter(&ctx.def.lock_p)?;
+    if flock.is_none() {
+        return dummy_err("File locking failed. Probably another instance is already running.");
+    }
     defer! {
         monitor_exit(flock);
     }
@@ -795,7 +1012,19 @@ fn main_inner(args: Vec<String>) -> CustRes<()> {
             }
         }
         debug_assert!(!ctx.def.iline.is_empty());
-        match ctx.bargs.get(&ctx.def.iline.as_bytes()[0]) {
+        let first_byte = ctx.def.iline.as_bytes()[0];
+        match ctx.cust_search.get(&first_byte) {
+            None => {}
+            Some(_inner) => {
+                ctx.def.iline_argidx = 1;
+                if cust_search(&mut ctx, first_byte)? {
+                    continue;
+                } else {
+                    break Ok(());
+                }
+            }
+        }
+        match ctx.bargs.get(&first_byte) {
             None => {}
             Some(inner) => {
                 ctx.def.iline_argidx = 1;
@@ -922,10 +1151,10 @@ fn read_note(folder: &path::Path, jobj: &mut InfoJsonElem) -> CustRes<()> {
     jobj.mtime = systemtime2millis(md.modified()?);
     jobj.content = fs::read_to_string(&npath)?;
     if jobj.content.contains("http://") || jobj.content.contains("https://") {
-        jobj.lbls.push("_bm".to_owned());
+        jobj.lbls.push("b".to_owned());
     }
     if jobj.content.split(['\n', '\r']).any(|r| r == "```") {
-        jobj.lbls.push("_code".to_owned());
+        jobj.lbls.push("c".to_owned());
     }
     if !apath.try_exists()? {
         return Ok(());
@@ -1012,11 +1241,15 @@ fn get_avail_tmpid(conn: &rusqlite::Connection) -> Result<i64, CustomErr> {
     }
 }
 
-fn monitor_enter(lock_p: &path::Path) -> CustRes<fs::File> {
-    file_lock(lock_p, b"\n")
+fn monitor_enter(lock_p: &path::Path) -> io::Result<Option<fs::File>> {
+    file_try_lock(lock_p, b"\n")
 }
-fn monitor_exit(fobj: fs::File) -> bool {
-    file_unlock(fobj)
+fn monitor_exit(fobj: Option<fs::File>) -> bool {
+    if let Some(bfobj) = fobj {
+        file_unlock(bfobj)
+    } else {
+        true
+    }
 }
 
 pub struct Ctx {
@@ -1026,6 +1259,7 @@ pub struct Ctx {
     cmds: BTreeMap<String, fn(&mut Ctx) -> CustRes<bool>>,
     cargs: BTreeMap<String, fn(&mut Ctx) -> CustRes<bool>>,
     bargs: BTreeMap<u8, fn(&mut Ctx) -> CustRes<bool>>,
+    cust_search: BTreeMap<u8, String>,
 }
 impl ops::Deref for Ctx {
     type Target = CtxDef;
@@ -1049,8 +1283,8 @@ mod ctxdef {
     #[derive(Default)]
     pub struct CtxDef {
         pub stdin_w: StdinWrapper,
-        home_dir: PathBuf,
-        everycom: PathBuf,
+        //home_dir: PathBuf,
+        //everycom: PathBuf,
         pub app_support_dir: PathBuf,
         note_dir: PathBuf,
         pub lock_p: PathBuf,
@@ -1059,23 +1293,20 @@ mod ctxdef {
         pub iline: String,
         pub iline_argidx: usize,
         pub editor_cmd: Vec<String>,
+        pub clip_cmd: Vec<String>,
         pub chosen_dir: String,
         pub chosen_lbl: String,
         //chosen_note: InfoJsonElem,
         pub filter_buf: Vec<i64>,
     }
 
-    const PKG_NAME: &str = env!("CARGO_PKG_NAME");
-    const _: () = assert!(!PKG_NAME.is_empty(), "Constraint on const");
-
     impl CtxDef {
-        pub fn init(home_dir: PathBuf) -> Self {
+        pub fn init(app_support_dir: PathBuf) -> Self {
+            //let mut retval = CtxDef::default();
             let mut retval = CtxDef {
-                home_dir,
+                app_support_dir,
                 ..Default::default()
             };
-            retval.everycom = retval.home_dir.join(".everycom");
-            retval.app_support_dir = retval.everycom.join(PKG_NAME);
             retval.lock_p = retval.app_support_dir.join("lock");
             retval.note_dir = retval.app_support_dir.join("note");
             retval
