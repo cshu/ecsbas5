@@ -114,6 +114,7 @@ fn cmd_yank(con: &mut Ctx) -> CustRes<bool> {
         finaltext += "\n";
     }
     finaltext += &format!("{}{}{}", "******* ", num_of_selected, " SELECTED\n");
+    coutln!("Begin copying to clipboard...");
     run_xclip(con, finaltext)
 }
 fn cmd_clip(con: &mut Ctx) -> CustRes<bool> {
