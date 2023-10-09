@@ -1,0 +1,1 @@
+,(tmpid in(select tmpid from lbls where lbl like '%' || ?1 || '%') or tmpid in(select tmpid from attachments where rel like '%' || ?1 || '%') or rel like '%' || ?1 || '%' or content like '%' || ?1 || '%') and tmpid in(select tmpid from lbls where lbl='c')
