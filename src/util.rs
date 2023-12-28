@@ -72,7 +72,7 @@ pub fn info_write_for_note(
     };
     push_comps_to_pb(note_dir_clone, rel);
     note_dir_clone.push(INFO_FN);
-    lbls.retain(|lbl| lbl.starts_with('_'));
+    lbls.retain(|lbl| lbl.len() > 1 && (!lbl.starts_with('_')));
     info_write(
         note_dir_clone,
         &InfoJsonElem {
